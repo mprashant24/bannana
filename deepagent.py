@@ -171,7 +171,7 @@ def create_prompt( personna='', task='', focus='', instructions='' ):
 # ------------------------------------------------------------------------
 #   Pipeline Construction
 # ------------------------------------------------------------------------
-def build_pipeline( task:str, isolate=False, collect_focus='collect.md' ):
+def build_pipeline( task:str, isolate=False, collect_focus='generic_collect.md' ):
   rmtree( STEPS_PATH, ignore_errors=True )
   STEPS_PATH.mkdir( parents=True )
 
@@ -218,9 +218,9 @@ def build_pipeline( task:str, isolate=False, collect_focus='collect.md' ):
     )
 
   agent_collect = make_agent( collect_focus )
-  agent_analyze = make_agent( 'analyze.md' )
-  agent_review  = make_agent( 'review.md' )
-  agent_report  = make_agent( 'report.md' )
+  agent_analyze = make_agent( 'generic_analyze.md' )
+  agent_review  = make_agent( 'generic_review.md' )
+  agent_report  = make_agent( 'generic_report.md' )
 
   return (
     RunnableLambda(lambda task: task)
