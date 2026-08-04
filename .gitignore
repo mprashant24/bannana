@@ -1,1 +1,5 @@
 .env
+bannana.code-workspace
+__pycache__/
+*.pyc
+.pytest_cache/
