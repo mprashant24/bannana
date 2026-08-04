@@ -1,5 +1,9 @@
 .env
-bannana.code-workspace
+.venv/
 __pycache__/
 *.pyc
+steps/
+repo/.git-context/
+bannana.code-workspace
 .pytest_cache/
+repo/
