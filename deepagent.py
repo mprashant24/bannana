@@ -37,7 +37,8 @@ from langchain_core.prompts   import ChatPromptTemplate
 from langchain_core.tools     import tool
 from pydantic                 import BaseModel, Field
 
-from tools.git_ops import get_diff_summary, map_changes_to_modules, save_commit_context
+from tools.embedding_tool import EmbeddingSemanticSearchTool
+from tools.git_ops         import GitOpsTool, get_diff_summary, map_changes_to_modules, save_commit_context
 
 
 
@@ -56,11 +57,12 @@ STEPS_PATH  = Path( ROOT, 'steps' )
 #   Class Definitions
 # ------------------------------------------------------------------------
 class DeepAgent:
-  def __init__( self, model, system_prompt, backend=None, debug=False, skills=None ):
+  def __init__( self, model, system_prompt, backend=None, debug=False, skills=None, tools=None ):
     self.system_prompt = system_prompt
 
     self.agent = create_deep_agent(
       model         = model,
+      tools         = tools or [],
       backend       = backend,
       skills        = skills or [],
       system_prompt = system_prompt,
@@ -169,7 +171,7 @@ def create_prompt( personna='', task='', focus='', instructions='' ):
 # ------------------------------------------------------------------------
 #   Pipeline Construction
 # ------------------------------------------------------------------------
-def build_pipeline( task:str, isolate=False, collect_focus='collect.md' ):
+def build_pipeline( task:str, isolate=False, collect_focus='generic_collect.md' ):
   rmtree( STEPS_PATH, ignore_errors=True )
   STEPS_PATH.mkdir( parents=True )
 
@@ -196,6 +198,11 @@ def build_pipeline( task:str, isolate=False, collect_focus='collect.md' ):
   personna     = Path( PROMPT_PATH, 'personna.md' ).read_text()
   instructions = Path( PROMPT_PATH, 'instructions.md' ).read_text()
 
+  # Shared across all 4 steps so a baseline built during Collect is reused
+  # in-memory (no re-embedding) by Analyze/Review/Report in the same run.
+  embedding_tool = EmbeddingSemanticSearchTool()
+  git_ops_tool   = GitOpsTool()
+
   def make_agent( focus_file:str ) -> DeepAgent:
     return DeepAgent(
       model         = model,
@@ -207,12 +214,13 @@ def build_pipeline( task:str, isolate=False, collect_focus='collect.md' ):
       ),
       backend       = backend,
       skills        = ['/skills'],
+      tools         = [embedding_tool, git_ops_tool],
     )
 
   agent_collect = make_agent( collect_focus )
-  agent_analyze = make_agent( 'analyze.md' )
-  agent_review  = make_agent( 'review.md' )
-  agent_report  = make_agent( 'report.md' )
+  agent_analyze = make_agent( 'generic_analyze.md' )
+  agent_review  = make_agent( 'generic_review.md' )
+  agent_report  = make_agent( 'generic_report.md' )
 
   return (
     RunnableLambda(lambda task: task)
@@ -228,24 +236,25 @@ def build_pipeline( task:str, isolate=False, collect_focus='collect.md' ):
 #   Incremental Diff Review Tool
 # ------------------------------------------------------------------------
 class IncrementalReviewInput( BaseModel ):
+  app_name      : str = Field( description='App name -- subfolder under /repo containing the target codebase' )
   base_commit   : str = Field( description='Baseline commit SHA or tag to compare from' )
   target_commit : str = Field( description='Target commit SHA or tag containing the changes to review' )
 
 
 @tool( 'run_incremental_code_review', args_schema=IncrementalReviewInput )
-def run_incremental_code_review( base_commit:str, target_commit:str ) -> str:
-  """Reviews the code changes between two commits in /repo (a security-focused
+def run_incremental_code_review( app_name:str, base_commit:str, target_commit:str ) -> str:
+  """Reviews the code changes between two commits in /repo/<app_name> (a security-focused
   review of just the diff, not the full codebase) and returns the report.
 
   The diff (changed files, patches, and full before/after file content) is
   computed up front via tools/git_ops.py and also saved to
-  /repo/.git-context/<target_commit>.json as an audit artifact.
+  /repo/<app_name>/.git-context/<target_commit>.json as an audit artifact.
   """
-  diff_summary = get_diff_summary( base_commit, target_commit )
+  diff_summary = get_diff_summary( app_name, base_commit, target_commit )
   modules      = map_changes_to_modules( diff_summary )
   context      = { **diff_summary, 'modules': modules }
 
-  save_commit_context( diff_summary['target_commit'], context )
+  save_commit_context( app_name, diff_summary['target_commit'], context )
 
   task = (
     'Perform a security-focused code review of a specific commit diff. '
