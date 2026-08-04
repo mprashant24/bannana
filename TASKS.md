@@ -9,19 +9,19 @@ This document outlines the detailed task breakdown for upgrading the Deep Agent 
 ### Task 1
 | Task ID | TASK-001: Implement Git Operations Tool (`git_ops_tool`) |
 | :--- | :--- |
-| **Owner** | |
+| **Owner** | Phillip |
 | **Change Details** | Create `tools/git_ops.py` wrapping Git CLI / `GitPython`. Implement `get_current_commit()`, `get_diff_summary(base_commit, target_commit)`, `map_changes_to_modules()`, and `save_commit_context(commit_id, context_data)`. |
 
 ### Task 2
 | Task ID | TASK-002: Implement Embedding & Semantic Search Tool (`embedding_tool`) |
 | :--- | :--- |
-| **Owner** | |
+| **Owner** | Prashant |
 | **Change Details** | Create `tools/embedding_tool.py` using FAISS/Chroma and HuggingFace/Bedrock embeddings. Implement `build_code_index(repo_path)`, `update_code_index(changed_files)`, and `search_relevant_snippets(query, scope_filters)`. |
 
 ### Task 3
 | Task ID | TASK-003: Implement Reporting & State Management Tool (`reporting_tool`) |
 | :--- | :--- |
-| **Owner** | |
+| **Owner** | Amanda |
 | **Change Details** | Create `tools/reporting_tool.py` to handle JSON/Markdown schema validation, finding reconciliation (`reconcile_findings` for New, Persistent, and Resolved issues), and output formatting (`format_output`). |
 
 ---
@@ -31,19 +31,19 @@ This document outlines the detailed task breakdown for upgrading the Deep Agent 
 ### Task 4
 | Task ID | TASK-004: Refactor Main Agent Engine for 7-Step Pipeline |
 | :--- | :--- |
-| **Owner** | |
+| **Owner** | Tom |
 | **Change Details** | Refactor `deepagent.py` to replace the 4-step pipeline with the 7-step pipeline: `Inventory Generation`, `Scope Detection`, `Execution of Analysis`, `Validating/Judging Results`, `Generation of Report`, `Validation/Judging of Report`, and `Saving Context`. |
 
 ### Task 5
 | Task ID | TASK-005: Create Step Prompt Templates |
 | :--- | :--- |
-| **Owner** | |
+| **Owner** | Tom |
 | **Change Details** | Create specialized markdown prompt files under `prompts/`: `inventory.md`, `scope.md`, `analysis.md`, `judge_results.md`, `report.md`, `judge_report.md`, and `context.md`. |
 
 ### Task 6
 | Task ID | TASK-006: Implement CLI Options for Baseline and Diff Modes |
 | :--- | :--- |
-| **Owner** | |
+| **Owner** | Phillip |
 | **Change Details** | Update `ArgumentParser` in `deepagent.py` to add `--mode` (`baseline` or `diff`) and `--commit <commit_id>` flags. Connect CLI options to control full repo vs incremental diff workflows. |
 
 ---
