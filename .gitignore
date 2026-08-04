@@ -7,3 +7,4 @@ repo/.git-context/
 bannana.code-workspace
 .pytest_cache/
 repo/
+steps/

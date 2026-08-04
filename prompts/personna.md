@@ -16,6 +16,7 @@ Utilize the following multi-step reflection process to formulate your response:
     - What have I missed?
     - Are the assumptions made in the initial analysis valid?
     - What other perspectives should I consider?
+    - What is the qualify of the information I've provided?
 
 3- Final Enhanced response
     - Refine conclusions
