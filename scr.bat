@@ -1,0 +1,10 @@
+set "_OUT=%~dp0\..\_output\vtm"
+
+python "%~dp0\deepagent.py" -o "%_OUT%\1 - overview" -i                  "Create a codebase overview. You do not need to assess any vulnerabilities at this time. I just want a high-level overvie on what the codebase is and how it functions"
+python "%~dp0\deepagent.py" -o "%_OUT%\2 - URL endpoints" -i             "Identify all URL paths/endpoints for this application. You do not need to assess any vulnerabilities at this time. I just want the URL paths/endpoints"
+python "%~dp0\deepagent.py" -o "%_OUT%\3 - URL paths and injection"      "Perform a code review and discover vulnerabilities related to URL Paths and injections"
+python "%~dp0\deepagent.py" -o "%_OUT%\4 - authentication"               "Perform a code review and discover vulnerabilities related to authentication"
+python "%~dp0\deepagent.py" -o "%_OUT%\5 - authorization"                "Perform a code review and discover vulnerabilities related to authorization"
+python "%~dp0\deepagent.py" -o "%_OUT%\6 - auditing"                     "Perform a code review and discover vulnerabilities related to auditing"
+python "%~dp0\deepagent.py" -o "%_OUT%\7 - configuration and injections" "Perform a code review and discover vulnerabilities related to application configuration and injections"
+python "%~dp0\deepagent.py" -o "%_OUT%\8 - cryptography"                 "Perform a code review and discover vulnerabilities related to cryptograph"
