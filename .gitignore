@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 steps/
 repo/.git-context/
+bannana.code-workspace
+.pytest_cache/
+repo/
