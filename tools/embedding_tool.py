@@ -70,14 +70,26 @@ RISK_KEYWORD_PATTERNS: Dict[str, List[str]] = {
 
 _METHODS_KW_RE = re.compile(r'methods\s*=\s*\[([^\]]*)\]', re.IGNORECASE)
 
+# Optional Python string-literal prefix (r'...', rb"...", f'...', etc.) before the opening quote.
+_STR_PREFIX = r'(?:[rRbBuUfF]{1,2})?'
+
 ROUTE_PATTERNS = {
     "python-decorator": re.compile(
-        r'@\w+\.(route|get|post|put|delete|patch|options|head)\(\s*[\'"](?P<path>[^\'"]+)[\'"](?P<rest>[^)]*)\)',
+        r'@\w+\.(route|get|post|put|delete|patch|options|head)\('
+        rf'\s*{_STR_PREFIX}[\'"](?P<path>[^\'"]+)[\'"](?P<rest>[^)]*)\)',
         re.IGNORECASE,
     ),
-    "django-url": re.compile(r'\b(?:path|re_path|url)\(\s*[\'"](?P<path>[^\'"]*)[\'"]'),
+    "django-url": re.compile(rf'\b(?:path|re_path|url)\(\s*{_STR_PREFIX}[\'"](?P<path>[^\'"]*)[\'"]'),
     "express": re.compile(r'\b\w+\.(get|post|put|delete|patch|use)\(\s*[\'"](?P<path>/[^\'"]*)[\'"]', re.IGNORECASE),
     "spring": re.compile(r'@(?:Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*)?[\'"](?P<path>[^\'"]+)[\'"]'),
+}
+
+# Which route patterns are meaningful for which detected file language.
+ROUTE_PATTERNS_BY_LANGUAGE: Dict[str, List[str]] = {
+    "python": ["python-decorator", "django-url"],
+    "javascript": ["express"],
+    "typescript": ["express"],
+    "java": ["spring"],
 }
 
 FRAMEWORK_MARKERS: Dict[str, List[str]] = {
@@ -390,53 +402,60 @@ class EmbeddingSemanticSearchTool(BaseTool):
         return tags
 
     @staticmethod
-    def _extract_routes(text: str, rel_path: str, repo_alias: str) -> List[Dict[str, Any]]:
+    def _extract_routes(text: str, rel_path: str, repo_alias: str, language: str) -> List[Dict[str, Any]]:
         routes: List[Dict[str, Any]] = []
+        active_patterns = set(ROUTE_PATTERNS_BY_LANGUAGE.get(language, ()))
+        if not active_patterns:
+            return routes
 
         def line_of(pos: int) -> int:
             return text.count("\n", 0, pos) + 1
 
-        for match in ROUTE_PATTERNS["python-decorator"].finditer(text):
-            verb = match.group(1).lower()
-            path = match.group("path")
-            rest = match.group("rest") or ""
-            if verb != "route":
-                methods = [verb.upper()]
-            else:
-                kw_match = _METHODS_KW_RE.search(rest)
-                if kw_match:
-                    methods = [m.strip().strip("'\"").upper() for m in kw_match.group(1).split(",") if m.strip()]
+        if "python-decorator" in active_patterns:
+            for match in ROUTE_PATTERNS["python-decorator"].finditer(text):
+                verb = match.group(1).lower()
+                path = match.group("path")
+                rest = match.group("rest") or ""
+                if verb != "route":
+                    methods = [verb.upper()]
                 else:
-                    methods = ["GET"]
-            for method in methods:
+                    kw_match = _METHODS_KW_RE.search(rest)
+                    if kw_match:
+                        methods = [m.strip().strip("'\"").upper() for m in kw_match.group(1).split(",") if m.strip()]
+                    else:
+                        methods = ["GET"]
+                for method in methods:
+                    routes.append({
+                        "repo": repo_alias, "path": path, "method": method,
+                        "file": rel_path, "line": line_of(match.start()), "source": "python-decorator",
+                    })
+
+        if "django-url" in active_patterns:
+            for match in ROUTE_PATTERNS["django-url"].finditer(text):
                 routes.append({
-                    "repo": repo_alias, "path": path, "method": method,
-                    "file": rel_path, "line": line_of(match.start()), "source": "python-decorator",
+                    "repo": repo_alias, "path": match.group("path"), "method": "ANY",
+                    "file": rel_path, "line": line_of(match.start()), "source": "django-url",
                 })
 
-        for match in ROUTE_PATTERNS["django-url"].finditer(text):
-            routes.append({
-                "repo": repo_alias, "path": match.group("path"), "method": "ANY",
-                "file": rel_path, "line": line_of(match.start()), "source": "django-url",
-            })
+        if "express" in active_patterns:
+            for match in ROUTE_PATTERNS["express"].finditer(text):
+                verb = match.group(1).lower()
+                if verb == "use":
+                    continue
+                routes.append({
+                    "repo": repo_alias, "path": match.group("path"), "method": verb.upper(),
+                    "file": rel_path, "line": line_of(match.start()), "source": "express",
+                })
 
-        for match in ROUTE_PATTERNS["express"].finditer(text):
-            verb = match.group(1).lower()
-            if verb == "use":
-                continue
-            routes.append({
-                "repo": repo_alias, "path": match.group("path"), "method": verb.upper(),
-                "file": rel_path, "line": line_of(match.start()), "source": "express",
-            })
-
-        for match in ROUTE_PATTERNS["spring"].finditer(text):
-            g0 = match.group(0)
-            method_match = re.search(r'@(Get|Post|Put|Delete|Patch)Mapping', g0)
-            method = method_match.group(1).upper() if method_match else "ANY"
-            routes.append({
-                "repo": repo_alias, "path": match.group("path"), "method": method,
-                "file": rel_path, "line": line_of(match.start()), "source": "spring",
-            })
+        if "spring" in active_patterns:
+            for match in ROUTE_PATTERNS["spring"].finditer(text):
+                g0 = match.group(0)
+                method_match = re.search(r'@(Get|Post|Put|Delete|Patch)Mapping', g0)
+                method = method_match.group(1).upper() if method_match else "ANY"
+                routes.append({
+                    "repo": repo_alias, "path": match.group("path"), "method": method,
+                    "file": rel_path, "line": line_of(match.start()), "source": "spring",
+                })
 
         return routes
 
@@ -496,7 +515,7 @@ class EmbeddingSemanticSearchTool(BaseTool):
 
                 file_hashes[node_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 frameworks.update(self._detect_frameworks(text, file_path))
-                route_inventory.extend(self._extract_routes(text, rel_path, repo_alias))
+                route_inventory.extend(self._extract_routes(text, rel_path, repo_alias, language))
                 risk_tags = self._detect_risk_tags(text, rel_path)
 
                 imports: Set[str] = set()
@@ -701,7 +720,7 @@ class EmbeddingSemanticSearchTool(BaseTool):
             self._file_hashes[node_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
             risk_tags = self._detect_risk_tags(text, rel_path)
-            self._route_inventory.extend(self._extract_routes(text, rel_path, repo_alias))
+            self._route_inventory.extend(self._extract_routes(text, rel_path, repo_alias, language))
 
             imports: Set[str] = set()
             if file_path.suffix == ".py":
