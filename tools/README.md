@@ -63,20 +63,34 @@ upstream dependencies, using the persisted import graph. Requires a prior baseli
 
 ## 💾 Persisted Context Layout
 
-Everything is written under the tool's `context_dir` (default `.deepagent_context/embeddings/`):
+Each indexed repo gets its **own top-level folder named after it** (its directory name, e.g.
+`vtm`), so multiple repos/apps can be indexed and committed side by side without one
+overwriting another. Everything lives under the tool's `context_dir` (default `output/`):
 
 ```
-.deepagent_context/embeddings/
-├── faiss_index/            # FAISS.save_local() output (index.faiss, index.pkl)
-├── metadata_store.json     # chunk_id -> {repo, path, language, chunk_index, risk_tags}
-├── blast_radius_graph.json # node_id -> {repo, path, imports, imported_by, risk_tags}
-├── route_inventory.json    # [{repo, path, method, file, line, source}, ...]
-├── tech_inventory.json     # {repos: {alias: {path, languages, frameworks}}}
-└── file_hashes.json        # node_id -> sha256(content), for change tracking
+output/
+├── manifest.json                          # repo_alias -> absolute source path
+├── vtm/                                   # <- top-level folder named after the repo
+│   └── context/embeddings/
+│       ├── faiss_index/                   # FAISS.save_local() output (index.faiss, index.pkl)
+│       ├── metadata_store.json            # chunk_id -> {repo, path, language, chunk_index, risk_tags}
+│       ├── blast_radius_graph.json        # node_id -> {repo, path, imports, imported_by, risk_tags}
+│       ├── route_inventory.json           # [{repo, path, method, file, line, source}, ...]
+│       ├── tech_inventory.json            # {path, languages, frameworks}
+│       └── file_hashes.json               # node_id -> sha256(content), for change tracking
+└── another-app/
+    └── context/embeddings/...
 ```
 
-`node_id` = `"{repo_alias}::{relative/posix/path}"`, where `repo_alias` is the repo directory's
-folder name (de-duplicated across `repo_paths` if there's a collision).
+`repo_alias` defaults to the repo directory's name (`Path(repo_path).name`) and is recorded in
+`manifest.json` the first time a repo is indexed/inventoried, so the same alias is reused on
+every later `index`/`diff`/`search`/`get_blast_radius` call for that path. If two different
+repo paths would produce the same folder name, the second gets a short hash suffix to avoid
+collisions. `node_id` = `"{repo_alias}::{relative/posix/path}"`.
+
+`search` and `get_blast_radius` operate across **all** persisted repo folders when
+`repo_paths` doesn't resolve to a specific known repo (the default), giving cross-repo
+querying; pass an explicit `repo_paths` to scope a call to one or more specific repos.
 
 ---
 
@@ -138,7 +152,7 @@ path and content:
 ```python
 from tools.embedding_tool import EmbeddingSemanticSearchTool
 
-tool = EmbeddingSemanticSearchTool(context_dir=".deepagent_context/embeddings")
+tool = EmbeddingSemanticSearchTool(context_dir="output")  # default; each repo -> output/<repo_alias>/
 
 tool.invoke({"action": "index", "mode": "baseline", "repo_paths": ["repo/vtm"]})
 tool.invoke({"action": "search", "query": "JWT verification", "top_k": 5})

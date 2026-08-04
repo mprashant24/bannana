@@ -3,4 +3,3 @@ bannana.code-workspace
 __pycache__/
 *.pyc
 .pytest_cache/
-.deepagent_context/

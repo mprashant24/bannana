@@ -43,8 +43,9 @@ class TestEmbeddingSemanticSearchTool(unittest.TestCase):
         result = self.tool._run(action="index", mode="baseline", repo_paths=[FIXTURE_REPO])
         self.assertIn("Successfully indexed", result)
         self.assertIn("Routes discovered: 2", result)
-        self.assertTrue((self.context_dir / "faiss_index").exists())
-        self.assertTrue((self.context_dir / "blast_radius_graph.json").exists())
+        repo_ctx = self.context_dir / "sample_repo" / "context" / "embeddings"
+        self.assertTrue((repo_ctx / "faiss_index").exists())
+        self.assertTrue((repo_ctx / "blast_radius_graph.json").exists())
 
     def test_index_invalid_mode(self):
         result = self.tool._run(action="index", mode="bogus", repo_paths=[FIXTURE_REPO])

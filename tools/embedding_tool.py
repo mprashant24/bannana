@@ -11,7 +11,13 @@ Notes on scope:
   `embeddings_model` field for production-quality recall.
 - Blast-radius dependency resolution is implemented via Python AST import
   analysis. Other languages are indexed, route-scanned, and risk-tagged,
-  but are not currently wired into the import dependency graph.
+  but are not currently wired into the dependency graph.
+- Persisted context is namespaced per repository: each repo gets its own
+  subfolder under `context_dir`, named after the repo (see
+  `_resolve_repo_alias`), so indexing/diffing one repo never overwrites
+  another repo's saved context. `search` and `get_blast_radius` merge
+  across all persisted repos when no specific `repo_paths` is matched,
+  giving cross-repo querying for free.
 """
 
 from __future__ import annotations
@@ -190,18 +196,20 @@ class EmbeddingSemanticSearchTool(BaseTool):
     )
     args_schema: Type[EmbeddingToolInput] = EmbeddingToolInput
 
-    context_dir: str = ".deepagent_context/embeddings"
+    context_dir: str = "output"
     embed_dimensions: int = 384
     chunk_size: int = 800
     chunk_overlap: int = 100
     embeddings_model: Any = None
 
-    _vector_store: Optional[FAISS] = PrivateAttr(default=None)
-    _metadata_store: Dict[str, Any] = PrivateAttr(default_factory=dict)
-    _dependency_graph: Dict[str, Any] = PrivateAttr(default_factory=dict)
-    _route_inventory: List[Dict[str, Any]] = PrivateAttr(default_factory=list)
-    _tech_inventory: Dict[str, Any] = PrivateAttr(default_factory=dict)
-    _file_hashes: Dict[str, str] = PrivateAttr(default_factory=dict)
+    # Per-repo in-memory caches, keyed by repo alias (see `_resolve_repo_alias`).
+    _vector_stores: Dict[str, FAISS] = PrivateAttr(default_factory=dict)
+    _metadata_stores: Dict[str, Dict[str, Any]] = PrivateAttr(default_factory=dict)
+    _dependency_graphs: Dict[str, Dict[str, Any]] = PrivateAttr(default_factory=dict)
+    _route_inventories: Dict[str, List[Dict[str, Any]]] = PrivateAttr(default_factory=dict)
+    _tech_inventories: Dict[str, Dict[str, Any]] = PrivateAttr(default_factory=dict)
+    _file_hashes: Dict[str, Dict[str, str]] = PrivateAttr(default_factory=dict)
+    _alias_manifest: Dict[str, str] = PrivateAttr(default_factory=dict)
 
     # -- LangChain entry point ----------------------------------------------
 
@@ -230,7 +238,7 @@ class EmbeddingSemanticSearchTool(BaseTool):
         elif action == "search":
             if not query:
                 return "[ERROR] Query parameter is required for 'search' action."
-            return self._perform_semantic_search(query, top_k)
+            return self._perform_semantic_search(query, top_k, repo_paths)
 
         elif action == "get_inventory":
             return self._generate_inventory(repo_paths)
@@ -238,7 +246,7 @@ class EmbeddingSemanticSearchTool(BaseTool):
         elif action == "get_blast_radius":
             if not changed_files:
                 return "[ERROR] changed_files parameter is required for 'get_blast_radius' action."
-            return self._calculate_blast_radius(changed_files)
+            return self._calculate_blast_radius(changed_files, repo_paths)
 
         else:
             return f"[ERROR] Unknown action '{action}'. Supported actions: 'index', 'search', 'get_inventory', 'get_blast_radius'."
@@ -250,56 +258,116 @@ class EmbeddingSemanticSearchTool(BaseTool):
             return self.embeddings_model
         return DeterministicHashingEmbeddings(dimensions=self.embed_dimensions)
 
-    # -- Context persistence paths --------------------------------------------
+    # -- Per-repo context namespacing ------------------------------------------
+    #
+    # Each repo is persisted under its own subfolder, named after the repo
+    # (its directory name) whenever possible:
+    #
+    #   <context_dir>/manifest.json          alias -> absolute source path
+    #   <context_dir>/<alias>/faiss_index/
+    #   <context_dir>/<alias>/metadata_store.json
+    #   <context_dir>/<alias>/blast_radius_graph.json
+    #   <context_dir>/<alias>/route_inventory.json
+    #   <context_dir>/<alias>/tech_inventory.json
+    #   <context_dir>/<alias>/file_hashes.json
 
     def _context_path(self) -> Path:
         return Path(self.context_dir)
 
-    def _index_dir(self) -> Path:
-        return self._context_path() / "faiss_index"
+    def _manifest_path(self) -> Path:
+        return self._context_path() / "manifest.json"
 
-    def _metadata_path(self) -> Path:
-        return self._context_path() / "metadata_store.json"
-
-    def _blast_graph_path(self) -> Path:
-        return self._context_path() / "blast_radius_graph.json"
-
-    def _route_inventory_path(self) -> Path:
-        return self._context_path() / "route_inventory.json"
-
-    def _tech_inventory_path(self) -> Path:
-        return self._context_path() / "tech_inventory.json"
-
-    def _file_hashes_path(self) -> Path:
-        return self._context_path() / "file_hashes.json"
+    def _repo_context_path(self, repo_alias: str) -> Path:
+        return self._context_path() / repo_alias / "context" / "embeddings"
 
     @staticmethod
     def _persist_json(path: Path, data: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, default=list), encoding="utf-8")
 
-    def _load_context(self, require_index: bool = False) -> Optional[str]:
-        if self._vector_store is None and self._index_dir().exists():
+    def _load_manifest(self) -> Dict[str, str]:
+        if not self._alias_manifest and self._manifest_path().exists():
             try:
-                self._vector_store = FAISS.load_local(
-                    str(self._index_dir()), self._get_embeddings(), allow_dangerous_deserialization=True
+                self._alias_manifest = json.loads(self._manifest_path().read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                self._alias_manifest = {}
+        return self._alias_manifest
+
+    def _save_manifest(self) -> None:
+        self._persist_json(self._manifest_path(), self._alias_manifest)
+
+    def _resolve_repo_alias(self, repo_root: Path) -> str:
+        """Assign each distinct repo path a stable, human-readable alias (its folder name)."""
+        resolved = str(repo_root.resolve())
+        manifest = self._load_manifest()
+        for alias, path in manifest.items():
+            if path == resolved:
+                return alias
+
+        base_alias = repo_root.name or "repo"
+        alias = base_alias
+        if alias in manifest and manifest[alias] != resolved:
+            alias = f"{base_alias}_{hashlib.sha256(resolved.encode('utf-8')).hexdigest()[:8]}"
+
+        manifest[alias] = resolved
+        self._alias_manifest = manifest
+        self._save_manifest()
+        return alias
+
+    def _discover_persisted_aliases(self) -> List[str]:
+        ctx = self._context_path()
+        if not ctx.exists():
+            return []
+        return sorted(
+            p.name for p in ctx.iterdir()
+            if p.is_dir() and (self._repo_context_path(p.name) / "metadata_store.json").exists()
+        )
+
+    def _requested_aliases(self, repo_paths: List[str]) -> List[str]:
+        """Resolve caller-supplied repo_paths (dir paths or bare alias names) to known aliases."""
+        aliases: List[str] = []
+        manifest = self._load_manifest()
+        for entry in repo_paths:
+            candidate: Optional[str] = None
+            p = Path(entry)
+            if p.exists():
+                resolved = str(p.resolve())
+                for alias, path in manifest.items():
+                    if path == resolved:
+                        candidate = alias
+                        break
+            if candidate is None:
+                for name in {p.name, entry}:
+                    if name and (self._repo_context_path(name) / "metadata_store.json").exists():
+                        candidate = name
+                        break
+            if candidate and candidate not in aliases:
+                aliases.append(candidate)
+        return aliases
+
+    def _ensure_repo_loaded(self, alias: str, require_index: bool = False) -> Optional[str]:
+        repo_dir = self._repo_context_path(alias)
+        if alias not in self._vector_stores and (repo_dir / "faiss_index").exists():
+            try:
+                self._vector_stores[alias] = FAISS.load_local(
+                    str(repo_dir / "faiss_index"), self._get_embeddings(), allow_dangerous_deserialization=True
                 )
             except Exception as exc:
                 if require_index:
-                    return f"[ERROR] Failed to load persisted FAISS index: {exc}"
-        if not self._metadata_store and self._metadata_path().exists():
-            self._metadata_store = json.loads(self._metadata_path().read_text(encoding="utf-8"))
-        if not self._dependency_graph and self._blast_graph_path().exists():
-            self._dependency_graph = json.loads(self._blast_graph_path().read_text(encoding="utf-8"))
-        if not self._route_inventory and self._route_inventory_path().exists():
-            self._route_inventory = json.loads(self._route_inventory_path().read_text(encoding="utf-8"))
-        if not self._tech_inventory and self._tech_inventory_path().exists():
-            self._tech_inventory = json.loads(self._tech_inventory_path().read_text(encoding="utf-8"))
-        if not self._file_hashes and self._file_hashes_path().exists():
-            self._file_hashes = json.loads(self._file_hashes_path().read_text(encoding="utf-8"))
+                    return f"[ERROR] Failed to load persisted FAISS index for '{alias}': {exc}"
+        if alias not in self._metadata_stores and (repo_dir / "metadata_store.json").exists():
+            self._metadata_stores[alias] = json.loads((repo_dir / "metadata_store.json").read_text(encoding="utf-8"))
+        if alias not in self._dependency_graphs and (repo_dir / "blast_radius_graph.json").exists():
+            self._dependency_graphs[alias] = json.loads((repo_dir / "blast_radius_graph.json").read_text(encoding="utf-8"))
+        if alias not in self._route_inventories and (repo_dir / "route_inventory.json").exists():
+            self._route_inventories[alias] = json.loads((repo_dir / "route_inventory.json").read_text(encoding="utf-8"))
+        if alias not in self._tech_inventories and (repo_dir / "tech_inventory.json").exists():
+            self._tech_inventories[alias] = json.loads((repo_dir / "tech_inventory.json").read_text(encoding="utf-8"))
+        if alias not in self._file_hashes and (repo_dir / "file_hashes.json").exists():
+            self._file_hashes[alias] = json.loads((repo_dir / "file_hashes.json").read_text(encoding="utf-8"))
 
-        if require_index and self._vector_store is None:
-            return "[ERROR] No persisted index found. Run action='index' with mode='baseline' first."
+        if require_index and alias not in self._vector_stores:
+            return f"[ERROR] No persisted index found for repo '{alias}'. Run action='index' with mode='baseline' first."
         return None
 
     # -- Repo scanning ---------------------------------------------------------
@@ -314,16 +382,6 @@ class EmbeddingSemanticSearchTool(BaseTool):
             if any(part in IGNORED_DIR_NAMES for part in path.relative_to(repo_root).parts[:-1]):
                 continue
             yield path
-
-    @staticmethod
-    def _unique_alias(name: str, used: Set[str]) -> str:
-        alias = name or "repo"
-        candidate = alias
-        counter = 1
-        while candidate in used:
-            counter += 1
-            candidate = f"{alias}_{counter}"
-        return candidate
 
     @staticmethod
     def _node_id(repo_alias: str, repo_root: Path, file_path: Path) -> str:
@@ -472,90 +530,73 @@ class EmbeddingSemanticSearchTool(BaseTool):
         chunks = splitter.split_text(text)
         return [c for c in chunks if c.strip()]
 
-    def _scan_repos(self, repo_paths: List[str]) -> Dict[str, Any]:
+    def _scan_single_repo(self, repo_root: Path, repo_alias: str) -> Dict[str, Any]:
+        """Scan one repo root and return its documents/metadata/routes/tech/dependency graph."""
         documents: List[Document] = []
         metadata_store: Dict[str, Any] = {}
         file_hashes: Dict[str, str] = {}
         route_inventory: List[Dict[str, Any]] = []
-        tech_inventory: Dict[str, Any] = {"repos": {}}
         dependency_nodes: Dict[str, Dict[str, Any]] = {}
-        used_aliases: Set[str] = set()
-        indexed_files = 0
-        missing_repos: List[str] = []
 
-        for repo_path_str in repo_paths:
-            repo_root = Path(repo_path_str)
-            if not repo_root.exists() or not repo_root.is_dir():
-                missing_repos.append(repo_path_str)
+        files = list(self._iter_source_files(repo_root))
+
+        module_map: Dict[str, str] = {}
+        for file_path in files:
+            if file_path.suffix == ".py":
+                module_map[self._module_name_for(repo_root, file_path)] = self._node_id(repo_alias, repo_root, file_path)
+
+        languages: Dict[str, int] = defaultdict(int)
+        frameworks: Set[str] = set()
+        indexed_files = 0
+
+        for file_path in files:
+            node_id = self._node_id(repo_alias, repo_root, file_path)
+            rel_path = file_path.relative_to(repo_root).as_posix()
+            language = LANGUAGE_BY_EXTENSION[file_path.suffix]
+            languages[language] += 1
+
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
                 continue
 
-            repo_alias = self._unique_alias(repo_root.name or repo_path_str, used_aliases)
-            used_aliases.add(repo_alias)
+            file_hashes[node_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            frameworks.update(self._detect_frameworks(text, file_path))
+            route_inventory.extend(self._extract_routes(text, rel_path, repo_alias, language))
+            risk_tags = self._detect_risk_tags(text, rel_path)
 
-            files = list(self._iter_source_files(repo_root))
+            imports: Set[str] = set()
+            if file_path.suffix == ".py":
+                for candidate in self._extract_python_import_candidates(file_path, repo_root):
+                    target = module_map.get(candidate)
+                    if target and target != node_id:
+                        imports.add(target)
 
-            module_map: Dict[str, str] = {}
-            for file_path in files:
-                if file_path.suffix == ".py":
-                    module_map[self._module_name_for(repo_root, file_path)] = self._node_id(repo_alias, repo_root, file_path)
-
-            languages: Dict[str, int] = defaultdict(int)
-            frameworks: Set[str] = set()
-
-            for file_path in files:
-                node_id = self._node_id(repo_alias, repo_root, file_path)
-                rel_path = file_path.relative_to(repo_root).as_posix()
-                language = LANGUAGE_BY_EXTENSION[file_path.suffix]
-                languages[language] += 1
-
-                try:
-                    text = file_path.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-
-                file_hashes[node_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                frameworks.update(self._detect_frameworks(text, file_path))
-                route_inventory.extend(self._extract_routes(text, rel_path, repo_alias, language))
-                risk_tags = self._detect_risk_tags(text, rel_path)
-
-                imports: Set[str] = set()
-                if file_path.suffix == ".py":
-                    for candidate in self._extract_python_import_candidates(file_path, repo_root):
-                        target = module_map.get(candidate)
-                        if target and target != node_id:
-                            imports.add(target)
-
-                dependency_nodes[node_id] = {
-                    "repo": repo_alias, "path": rel_path, "language": language,
-                    "imports": sorted(imports), "imported_by": [], "risk_tags": sorted(risk_tags),
-                }
-
-                for i, chunk in enumerate(self._split_text(text, language)):
-                    chunk_id = f"{node_id}#{i}"
-                    meta = {
-                        "chunk_id": chunk_id, "node_id": node_id, "repo": repo_alias,
-                        "path": rel_path, "language": language, "chunk_index": i,
-                        "risk_tags": sorted(risk_tags),
-                    }
-                    metadata_store[chunk_id] = meta
-                    documents.append(Document(page_content=chunk, metadata=meta))
-
-                indexed_files += 1
-
-            pkg_json = repo_root / "package.json"
-            if pkg_json.exists():
-                try:
-                    frameworks.update(self._detect_frameworks(
-                        pkg_json.read_text(encoding="utf-8", errors="ignore"), pkg_json
-                    ))
-                except OSError:
-                    pass
-
-            tech_inventory["repos"][repo_alias] = {
-                "path": str(repo_root),
-                "languages": dict(languages),
-                "frameworks": sorted(frameworks),
+            dependency_nodes[node_id] = {
+                "repo": repo_alias, "path": rel_path, "language": language,
+                "imports": sorted(imports), "imported_by": [], "risk_tags": sorted(risk_tags),
             }
+
+            for i, chunk in enumerate(self._split_text(text, language)):
+                chunk_id = f"{node_id}#{i}"
+                meta = {
+                    "chunk_id": chunk_id, "node_id": node_id, "repo": repo_alias,
+                    "path": rel_path, "language": language, "chunk_index": i,
+                    "risk_tags": sorted(risk_tags),
+                }
+                metadata_store[chunk_id] = meta
+                documents.append(Document(page_content=chunk, metadata=meta))
+
+            indexed_files += 1
+
+        pkg_json = repo_root / "package.json"
+        if pkg_json.exists():
+            try:
+                frameworks.update(self._detect_frameworks(
+                    pkg_json.read_text(encoding="utf-8", errors="ignore"), pkg_json
+                ))
+            except OSError:
+                pass
 
         for node_id, node in dependency_nodes.items():
             for dep in node["imports"]:
@@ -564,65 +605,93 @@ class EmbeddingSemanticSearchTool(BaseTool):
         for node in dependency_nodes.values():
             node["imported_by"] = sorted(set(node["imported_by"]))
 
+        tech_info = {"path": str(repo_root), "languages": dict(languages), "frameworks": sorted(frameworks)}
+
         return {
             "documents": documents,
             "metadata_store": metadata_store,
             "file_hashes": file_hashes,
             "route_inventory": route_inventory,
-            "tech_inventory": tech_inventory,
+            "tech_info": tech_info,
             "dependency_graph": dependency_nodes,
             "indexed_files": indexed_files,
-            "missing_repos": missing_repos,
-            "repo_aliases": sorted(used_aliases),
         }
 
     # -- Action: index / baseline ----------------------------------------------
 
     def _build_baseline_index(self, repo_paths: List[str]) -> str:
-        scan = self._scan_repos(repo_paths)
-        documents = scan["documents"]
+        summaries: List[str] = []
+        missing_repos: List[str] = []
+        processed_aliases: List[str] = []
+        total_files = total_chunks = total_routes = total_high_risk = 0
 
-        if not documents:
-            missing = f" Missing paths: {scan['missing_repos']}." if scan["missing_repos"] else ""
+        for repo_path_str in repo_paths:
+            repo_root = Path(repo_path_str)
+            if not repo_root.exists() or not repo_root.is_dir():
+                missing_repos.append(repo_path_str)
+                continue
+
+            alias = self._resolve_repo_alias(repo_root)
+            scan = self._scan_single_repo(repo_root, alias)
+
+            if not scan["documents"]:
+                summaries.append(f"  - {alias} ({repo_root}): no source files found, skipped")
+                continue
+
+            repo_dir = self._repo_context_path(alias)
+            repo_dir.mkdir(parents=True, exist_ok=True)
+
+            doc_ids = [doc.metadata["chunk_id"] for doc in scan["documents"]]
+            vector_store = FAISS.from_documents(scan["documents"], self._get_embeddings(), ids=doc_ids)
+            vector_store.save_local(str(repo_dir / "faiss_index"))
+
+            self._vector_stores[alias] = vector_store
+            self._metadata_stores[alias] = scan["metadata_store"]
+            self._dependency_graphs[alias] = scan["dependency_graph"]
+            self._route_inventories[alias] = scan["route_inventory"]
+            self._tech_inventories[alias] = scan["tech_info"]
+            self._file_hashes[alias] = scan["file_hashes"]
+
+            self._persist_json(repo_dir / "metadata_store.json", scan["metadata_store"])
+            self._persist_json(repo_dir / "blast_radius_graph.json", scan["dependency_graph"])
+            self._persist_json(repo_dir / "route_inventory.json", scan["route_inventory"])
+            self._persist_json(repo_dir / "tech_inventory.json", scan["tech_info"])
+            self._persist_json(repo_dir / "file_hashes.json", scan["file_hashes"])
+
+            high_risk = sum(1 for n in scan["dependency_graph"].values() if n["risk_tags"])
+            total_files += scan["indexed_files"]
+            total_chunks += len(scan["documents"])
+            total_routes += len(scan["route_inventory"])
+            total_high_risk += high_risk
+            processed_aliases.append(alias)
+
+            summaries.append(
+                f"  - {alias} ({repo_root}) -> {repo_dir}: files={scan['indexed_files']}, "
+                f"chunks={len(scan['documents'])}, routes={len(scan['route_inventory'])}, high_risk={high_risk}"
+            )
+
+        if not processed_aliases:
+            missing = f" Missing paths: {missing_repos}." if missing_repos else ""
             return f"[ERROR] No source files found to index across repo_paths={repo_paths}.{missing}"
 
-        context_path = self._context_path()
-        context_path.mkdir(parents=True, exist_ok=True)
-
-        doc_ids = [doc.metadata["chunk_id"] for doc in documents]
-        vector_store = FAISS.from_documents(documents, self._get_embeddings(), ids=doc_ids)
-        vector_store.save_local(str(self._index_dir()))
-
-        self._vector_store = vector_store
-        self._metadata_store = scan["metadata_store"]
-        self._dependency_graph = scan["dependency_graph"]
-        self._route_inventory = scan["route_inventory"]
-        self._tech_inventory = scan["tech_inventory"]
-        self._file_hashes = scan["file_hashes"]
-
-        self._persist_json(self._metadata_path(), self._metadata_store)
-        self._persist_json(self._blast_graph_path(), self._dependency_graph)
-        self._persist_json(self._route_inventory_path(), self._route_inventory)
-        self._persist_json(self._tech_inventory_path(), self._tech_inventory)
-        self._persist_json(self._file_hashes_path(), self._file_hashes)
-
-        high_risk = sum(1 for n in self._dependency_graph.values() if n["risk_tags"])
-
-        return (
+        header = (
             "[INDEX] Successfully indexed repositories in baseline mode.\n"
-            f"Repositories: {', '.join(scan['repo_aliases']) or 'none'}\n"
-            f"Files indexed: {scan['indexed_files']}\n"
-            f"Chunks embedded: {len(documents)}\n"
-            f"Routes discovered: {len(self._route_inventory)}\n"
-            f"High-risk modules flagged: {high_risk}\n"
-            f"Context persisted to: {context_path}"
+            f"Repositories: {', '.join(processed_aliases)}\n"
+            f"Files indexed: {total_files}\n"
+            f"Chunks embedded: {total_chunks}\n"
+            f"Routes discovered: {total_routes}\n"
+            f"High-risk modules flagged: {total_high_risk}\n"
+            f"Context root: {self._context_path()} (each repo stored in its own named subfolder)\n"
         )
+        if missing_repos:
+            header += f"Missing paths (skipped): {missing_repos}\n"
+        return header + "\n".join(summaries)
 
     # -- Action: index / diff ---------------------------------------------------
 
-    def _resolve_node_ids(self, paths: List[str]) -> Set[str]:
+    @staticmethod
+    def _resolve_node_ids(graph: Dict[str, Any], paths: List[str]) -> Set[str]:
         resolved: Set[str] = set()
-        graph = self._dependency_graph
         for raw in paths:
             normalized = raw.replace("\\", "/").strip()
             if not normalized:
@@ -631,12 +700,13 @@ class EmbeddingSemanticSearchTool(BaseTool):
                 resolved.add(normalized)
                 continue
             for node_id, node in graph.items():
-                if node["path"] == normalized or node_id.endswith(f"::{normalized}") or normalized.endswith(f"/{node['path']}") or normalized == node["path"]:
+                if (node["path"] == normalized or node_id.endswith(f"::{normalized}")
+                        or normalized.endswith(f"/{node['path']}") or normalized == node["path"]):
                     resolved.add(node_id)
         return resolved
 
-    def _blast_radius_node_ids(self, node_ids: Set[str]) -> Set[str]:
-        graph = self._dependency_graph
+    @staticmethod
+    def _blast_radius_node_ids(graph: Dict[str, Any], node_ids: Set[str]) -> Set[str]:
         visited: Set[str] = set()
         queue = deque(node_ids)
         while queue:
@@ -651,147 +721,194 @@ class EmbeddingSemanticSearchTool(BaseTool):
         return visited
 
     def _refresh_diff_index(self, repo_paths: List[str], changed_files: List[str]) -> str:
-        error = self._load_context(require_index=True)
-        if error:
-            return error
-
         if not changed_files:
             return "[ERROR] changed_files parameter is required for diff mode indexing."
 
-        changed_node_ids = self._resolve_node_ids(changed_files)
-        if not changed_node_ids:
-            return (
-                f"[ERROR] None of the provided changed_files could be matched to indexed nodes: {changed_files}. "
-                "Run a baseline index first, or verify the paths are relative to an indexed repo_paths entry."
-            )
+        repo_summaries: List[str] = []
+        missing_repos: List[str] = []
+        load_failures: List[str] = []
+        any_repo_matched = False
+        total_changed = total_impacted = total_reembedded = total_removed = total_evicted = total_routes_removed = 0
+        touched_aliases: List[str] = []
 
-        impacted_node_ids = self._blast_radius_node_ids(changed_node_ids)
-        refresh_targets = sorted(changed_node_ids | impacted_node_ids)
-
-        module_maps: Dict[str, Dict[str, str]] = {}
-        repo_roots: Dict[str, Path] = {}
         for repo_path_str in repo_paths:
             repo_root = Path(repo_path_str)
-            if not repo_root.exists():
+            if not repo_root.exists() or not repo_root.is_dir():
+                missing_repos.append(repo_path_str)
                 continue
-            alias = repo_root.name
-            repo_roots[alias] = repo_root
+
+            alias = self._resolve_repo_alias(repo_root)
+            load_error = self._ensure_repo_loaded(alias, require_index=True)
+            if load_error:
+                load_failures.append(load_error)
+                continue
+
+            graph = self._dependency_graphs.get(alias, {})
+            changed_node_ids = self._resolve_node_ids(graph, changed_files)
+            if not changed_node_ids:
+                continue  # changed_files don't belong to this repo's graph; skip quietly
+
+            any_repo_matched = True
+            touched_aliases.append(alias)
+            impacted_node_ids = self._blast_radius_node_ids(graph, changed_node_ids)
+            refresh_targets = sorted(changed_node_ids | impacted_node_ids)
+
             module_map: Dict[str, str] = {}
             for file_path in self._iter_source_files(repo_root):
                 if file_path.suffix == ".py":
                     module_map[self._module_name_for(repo_root, file_path)] = self._node_id(alias, repo_root, file_path)
-            module_maps[alias] = module_map
 
-        evicted_chunks = 0
-        removed_routes = 0
-        reembedded_files = 0
-        removed_files: List[str] = []
+            metadata_store = self._metadata_stores.setdefault(alias, {})
+            route_inventory = self._route_inventories.setdefault(alias, [])
+            file_hashes = self._file_hashes.setdefault(alias, {})
+            vector_store = self._vector_stores.get(alias)
 
-        for node_id in refresh_targets:
-            node = self._dependency_graph.get(node_id)
-            if node is None:
-                continue
-            repo_alias = node["repo"]
-            rel_path = node["path"]
-            repo_root = repo_roots.get(repo_alias)
+            evicted_chunks = removed_routes = reembedded_files = 0
+            removed_files: List[str] = []
 
-            stale_chunk_ids = [cid for cid, meta in self._metadata_store.items() if meta.get("node_id") == node_id]
-            if stale_chunk_ids and self._vector_store is not None:
-                self._vector_store.delete(ids=stale_chunk_ids)
-            for cid in stale_chunk_ids:
-                self._metadata_store.pop(cid, None)
-                evicted_chunks += 1
+            for node_id in refresh_targets:
+                node = graph.get(node_id)
+                if node is None:
+                    continue
+                rel_path = node["path"]
 
-            before = len(self._route_inventory)
-            self._route_inventory = [
-                r for r in self._route_inventory if not (r["repo"] == repo_alias and r["file"] == rel_path)
-            ]
-            removed_routes += before - len(self._route_inventory)
+                stale_chunk_ids = [cid for cid, meta in metadata_store.items() if meta.get("node_id") == node_id]
+                if stale_chunk_ids and vector_store is not None:
+                    vector_store.delete(ids=stale_chunk_ids)
+                for cid in stale_chunk_ids:
+                    metadata_store.pop(cid, None)
+                    evicted_chunks += 1
 
-            file_path = (repo_root / rel_path) if repo_root else None
-            if file_path is None or not file_path.exists():
-                removed_files.append(node_id)
-                del self._dependency_graph[node_id]
-                self._file_hashes.pop(node_id, None)
-                continue
+                before = len(route_inventory)
+                route_inventory[:] = [r for r in route_inventory if r["file"] != rel_path]
+                removed_routes += before - len(route_inventory)
 
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-            language = LANGUAGE_BY_EXTENSION.get(file_path.suffix, node["language"])
-            self._file_hashes[node_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                file_path = repo_root / rel_path
+                if not file_path.exists():
+                    removed_files.append(node_id)
+                    del graph[node_id]
+                    file_hashes.pop(node_id, None)
+                    continue
 
-            risk_tags = self._detect_risk_tags(text, rel_path)
-            self._route_inventory.extend(self._extract_routes(text, rel_path, repo_alias, language))
+                text = file_path.read_text(encoding="utf-8", errors="ignore")
+                language = LANGUAGE_BY_EXTENSION.get(file_path.suffix, node["language"])
+                file_hashes[node_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-            imports: Set[str] = set()
-            if file_path.suffix == ".py":
-                module_map = module_maps.get(repo_alias, {})
-                for candidate in self._extract_python_import_candidates(file_path, repo_root):
-                    target = module_map.get(candidate)
-                    if target and target != node_id:
-                        imports.add(target)
+                risk_tags = self._detect_risk_tags(text, rel_path)
+                route_inventory.extend(self._extract_routes(text, rel_path, alias, language))
 
-            node["imports"] = sorted(imports)
-            node["risk_tags"] = sorted(risk_tags)
+                imports: Set[str] = set()
+                if file_path.suffix == ".py":
+                    for candidate in self._extract_python_import_candidates(file_path, repo_root):
+                        target = module_map.get(candidate)
+                        if target and target != node_id:
+                            imports.add(target)
 
-            new_docs: List[Document] = []
-            for i, chunk in enumerate(self._split_text(text, language)):
-                chunk_id = f"{node_id}#{i}"
-                meta = {
-                    "chunk_id": chunk_id, "node_id": node_id, "repo": repo_alias, "path": rel_path,
-                    "language": language, "chunk_index": i, "risk_tags": sorted(risk_tags),
-                }
-                self._metadata_store[chunk_id] = meta
-                new_docs.append(Document(page_content=chunk, metadata=meta))
+                node["imports"] = sorted(imports)
+                node["risk_tags"] = sorted(risk_tags)
 
-            if new_docs:
-                new_ids = [doc.metadata["chunk_id"] for doc in new_docs]
-                if self._vector_store is None:
-                    self._vector_store = FAISS.from_documents(new_docs, self._get_embeddings(), ids=new_ids)
-                else:
-                    self._vector_store.add_documents(new_docs, ids=new_ids)
-            reembedded_files += 1
+                new_docs: List[Document] = []
+                for i, chunk in enumerate(self._split_text(text, language)):
+                    chunk_id = f"{node_id}#{i}"
+                    meta = {
+                        "chunk_id": chunk_id, "node_id": node_id, "repo": alias, "path": rel_path,
+                        "language": language, "chunk_index": i, "risk_tags": sorted(risk_tags),
+                    }
+                    metadata_store[chunk_id] = meta
+                    new_docs.append(Document(page_content=chunk, metadata=meta))
 
-        for node in self._dependency_graph.values():
-            node["imported_by"] = []
-        for node_id, node in self._dependency_graph.items():
-            for dep in node["imports"]:
-                if dep in self._dependency_graph:
-                    self._dependency_graph[dep]["imported_by"].append(node_id)
-        for node in self._dependency_graph.values():
-            node["imported_by"] = sorted(set(node["imported_by"]))
+                if new_docs:
+                    new_ids = [doc.metadata["chunk_id"] for doc in new_docs]
+                    if vector_store is None:
+                        vector_store = FAISS.from_documents(new_docs, self._get_embeddings(), ids=new_ids)
+                        self._vector_stores[alias] = vector_store
+                    else:
+                        vector_store.add_documents(new_docs, ids=new_ids)
+                reembedded_files += 1
 
-        if self._vector_store is not None:
-            self._vector_store.save_local(str(self._index_dir()))
-        self._persist_json(self._metadata_path(), self._metadata_store)
-        self._persist_json(self._blast_graph_path(), self._dependency_graph)
-        self._persist_json(self._route_inventory_path(), self._route_inventory)
-        self._persist_json(self._file_hashes_path(), self._file_hashes)
+            for node in graph.values():
+                node["imported_by"] = []
+            for node_id, node in graph.items():
+                for dep in node["imports"]:
+                    if dep in graph:
+                        graph[dep]["imported_by"].append(node_id)
+            for node in graph.values():
+                node["imported_by"] = sorted(set(node["imported_by"]))
 
-        return (
+            repo_dir = self._repo_context_path(alias)
+            if vector_store is not None:
+                vector_store.save_local(str(repo_dir / "faiss_index"))
+            self._persist_json(repo_dir / "metadata_store.json", metadata_store)
+            self._persist_json(repo_dir / "blast_radius_graph.json", graph)
+            self._persist_json(repo_dir / "route_inventory.json", route_inventory)
+            self._persist_json(repo_dir / "file_hashes.json", file_hashes)
+
+            total_changed += len(changed_node_ids)
+            total_impacted += len(impacted_node_ids)
+            total_reembedded += reembedded_files
+            total_removed += len(removed_files)
+            total_evicted += evicted_chunks
+            total_routes_removed += removed_routes
+
+            repo_summaries.append(
+                f"  - {alias}: changed={len(changed_node_ids)}, blast_radius_impacted={len(impacted_node_ids)}, "
+                f"re-embedded={reembedded_files}, removed={len(removed_files)}, chunks_evicted={evicted_chunks}, "
+                f"routes_removed={removed_routes}"
+            )
+
+        if not any_repo_matched:
+            if load_failures:
+                return load_failures[0]
+            return (
+                f"[ERROR] None of the provided changed_files could be matched to an indexed repo: {changed_files}. "
+                "Run a baseline index first, or verify repo_paths/changed_files are correct."
+            )
+
+        header = (
             "[INDEX] Successfully refreshed index in diff mode.\n"
-            f"Changed files: {len(changed_node_ids)}\n"
-            f"Blast-radius impacted files also refreshed: {len(impacted_node_ids)}\n"
-            f"Files re-embedded: {reembedded_files}\n"
-            f"Files removed (deleted on disk): {len(removed_files)}\n"
-            f"Chunks evicted: {evicted_chunks}\n"
-            f"Route entries removed: {removed_routes}\n"
-            f"Context persisted to: {self._context_path()}"
+            f"Repositories touched: {', '.join(touched_aliases)}\n"
+            f"Changed files: {total_changed}\n"
+            f"Blast-radius impacted files also refreshed: {total_impacted}\n"
+            f"Files re-embedded: {total_reembedded}\n"
+            f"Files removed (deleted on disk): {total_removed}\n"
+            f"Chunks evicted: {total_evicted}\n"
+            f"Route entries removed: {total_routes_removed}\n"
         )
+        if missing_repos:
+            header += f"Missing repo paths (skipped): {missing_repos}\n"
+        return header + "\n".join(repo_summaries)
 
     # -- Action: search ----------------------------------------------------------
 
-    def _perform_semantic_search(self, query: str, top_k: Optional[int]) -> str:
-        error = self._load_context(require_index=True)
-        if error:
-            return error
+    def _perform_semantic_search(self, query: str, top_k: Optional[int], repo_paths: Optional[List[str]] = None) -> str:
+        requested = self._requested_aliases(repo_paths or [])
+        aliases = requested or self._discover_persisted_aliases()
+        if not aliases:
+            return "[ERROR] No persisted index found. Run action='index' with mode='baseline' first."
 
         k = top_k or 5
-        results = self._vector_store.similarity_search_with_score(query, k=k)
-        if not results:
+        all_results = []
+        load_errors: List[str] = []
+        for alias in aliases:
+            error = self._ensure_repo_loaded(alias, require_index=True)
+            if error:
+                load_errors.append(error)
+                continue
+            store = self._vector_stores.get(alias)
+            if store is None:
+                continue
+            all_results.extend(store.similarity_search_with_score(query, k=k))
+
+        if not all_results:
+            if load_errors and len(load_errors) == len(aliases):
+                return load_errors[0]
             return f"[SEARCH] No relevant results found for query: '{query}'"
 
-        blocks = [f"[SEARCH] Top {len(results)} result(s) for query: '{query}'"]
-        for rank, (doc, score) in enumerate(results, start=1):
+        all_results.sort(key=lambda pair: pair[1])
+        top_results = all_results[:k]
+
+        blocks = [f"[SEARCH] Top {len(top_results)} result(s) for query: '{query}' (searched repos: {', '.join(aliases)})"]
+        for rank, (doc, score) in enumerate(top_results, start=1):
             meta = doc.metadata
             snippet = doc.page_content.strip()
             if len(snippet) > 400:
@@ -808,88 +925,122 @@ class EmbeddingSemanticSearchTool(BaseTool):
     # -- Action: get_inventory ------------------------------------------------
 
     def _generate_inventory(self, repo_paths: List[str]) -> str:
-        scan = self._scan_repos(repo_paths)
+        repo_reports: List[tuple] = []
+        missing_repos: List[str] = []
+        total_files = 0
 
-        if not scan["repo_aliases"]:
-            missing = f" Missing paths: {scan['missing_repos']}." if scan["missing_repos"] else ""
+        for repo_path_str in repo_paths:
+            repo_root = Path(repo_path_str)
+            if not repo_root.exists() or not repo_root.is_dir():
+                missing_repos.append(repo_path_str)
+                continue
+
+            alias = self._resolve_repo_alias(repo_root)
+            scan = self._scan_single_repo(repo_root, alias)
+
+            repo_dir = self._repo_context_path(alias)
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            self._dependency_graphs[alias] = scan["dependency_graph"]
+            self._route_inventories[alias] = scan["route_inventory"]
+            self._tech_inventories[alias] = scan["tech_info"]
+            self._file_hashes[alias] = scan["file_hashes"]
+            self._persist_json(repo_dir / "blast_radius_graph.json", scan["dependency_graph"])
+            self._persist_json(repo_dir / "route_inventory.json", scan["route_inventory"])
+            self._persist_json(repo_dir / "tech_inventory.json", scan["tech_info"])
+            self._persist_json(repo_dir / "file_hashes.json", scan["file_hashes"])
+
+            total_files += scan["indexed_files"]
+            repo_reports.append((alias, scan))
+
+        if not repo_reports:
+            missing = f" Missing paths: {missing_repos}." if missing_repos else ""
             return f"[ERROR] No repositories could be scanned for repo_paths={repo_paths}.{missing}"
 
-        self._dependency_graph = scan["dependency_graph"]
-        self._route_inventory = scan["route_inventory"]
-        self._tech_inventory = scan["tech_inventory"]
-        self._file_hashes = scan["file_hashes"]
-        self._context_path().mkdir(parents=True, exist_ok=True)
-        self._persist_json(self._blast_graph_path(), self._dependency_graph)
-        self._persist_json(self._route_inventory_path(), self._route_inventory)
-        self._persist_json(self._tech_inventory_path(), self._tech_inventory)
-        self._persist_json(self._file_hashes_path(), self._file_hashes)
-
         lines = ["# Multi-Repo Technology & Route Inventory", "", "## Technology Inventory"]
-        for alias, info in scan["tech_inventory"]["repos"].items():
+        for alias, scan in repo_reports:
+            info = scan["tech_info"]
             lang_summary = ", ".join(f"{lang} ({count})" for lang, count in sorted(info["languages"].items()))
             fw_summary = ", ".join(info["frameworks"]) or "none detected"
             lines.append(f"- **{alias}** ({info['path']}): languages: {lang_summary or 'none'}; frameworks: {fw_summary}")
 
         lines.append("")
         lines.append("## Route Inventory")
-        if scan["route_inventory"]:
+        all_routes = [r for _, scan in repo_reports for r in scan["route_inventory"]]
+        if all_routes:
             lines.append("| Method | Path | Handler File | Repo |")
             lines.append("|---|---|---|---|")
-            for route in sorted(scan["route_inventory"], key=lambda r: (r["repo"], r["path"])):
+            for route in sorted(all_routes, key=lambda r: (r["repo"], r["path"])):
                 lines.append(f"| {route['method']} | {route['path']} | {route['file']} | {route['repo']} |")
         else:
             lines.append("No routes discovered.")
 
         lines.append("")
         lines.append("## High-Risk Modules")
-        high_risk_nodes = [n for n in scan["dependency_graph"].values() if n["risk_tags"]]
-        if high_risk_nodes:
-            for node in sorted(high_risk_nodes, key=lambda n: (n["repo"], n["path"])):
+        all_high_risk = [n for _, scan in repo_reports for n in scan["dependency_graph"].values() if n["risk_tags"]]
+        if all_high_risk:
+            for node in sorted(all_high_risk, key=lambda n: (n["repo"], n["path"])):
                 lines.append(f"- [{'/'.join(node['risk_tags'])}] {node['repo']}::{node['path']}")
         else:
             lines.append("No high-risk modules flagged.")
 
         lines.append("")
-        lines.append(f"Files scanned: {scan['indexed_files']}")
-        if scan["missing_repos"]:
-            lines.append(f"Missing repo paths: {scan['missing_repos']}")
+        lines.append(f"Files scanned: {total_files}")
+        lines.append(f"Context root: {self._context_path()} (subfolders: {', '.join(a for a, _ in repo_reports)})")
+        if missing_repos:
+            lines.append(f"Missing repo paths: {missing_repos}")
 
         return "\n".join(lines)
 
     # -- Action: get_blast_radius ----------------------------------------------
 
-    def _calculate_blast_radius(self, changed_files: List[str]) -> str:
-        self._load_context(require_index=False)
-        graph = self._dependency_graph
-        if not graph:
+    def _calculate_blast_radius(self, changed_files: List[str], repo_paths: Optional[List[str]] = None) -> str:
+        requested = self._requested_aliases(repo_paths or [])
+        aliases = requested or self._discover_persisted_aliases()
+        if not aliases:
             return (
                 "[ERROR] No blast radius graph available. Run action='index' with mode='baseline' first "
                 f"to build the dependency graph. (changed_files={changed_files})"
             )
 
-        changed_node_ids = self._resolve_node_ids(changed_files)
-        resolved_paths = {graph[nid]["path"] for nid in changed_node_ids if nid in graph}
+        merged_graph: Dict[str, Any] = {}
+        for alias in aliases:
+            self._ensure_repo_loaded(alias, require_index=False)
+            merged_graph.update(self._dependency_graphs.get(alias, {}))
+
+        if not merged_graph:
+            return (
+                "[ERROR] No blast radius graph available. Run action='index' with mode='baseline' first "
+                f"to build the dependency graph. (changed_files={changed_files})"
+            )
+
+        changed_node_ids = self._resolve_node_ids(merged_graph, changed_files)
+        resolved_paths = {merged_graph[nid]["path"] for nid in changed_node_ids if nid in merged_graph}
         unresolved = [
             f for f in changed_files
-            if f.replace("\\", "/") not in changed_node_ids and not f.replace("\\", "/").endswith(tuple(f"/{p}" for p in resolved_paths))
+            if f.replace("\\", "/") not in changed_node_ids
             and f.replace("\\", "/") not in resolved_paths
+            and not any(f.replace("\\", "/").endswith(f"/{p}") for p in resolved_paths)
         ]
 
         direct_impact: Set[str] = set()
         for nid in changed_node_ids:
-            direct_impact.update(graph.get(nid, {}).get("imported_by", []))
+            direct_impact.update(merged_graph.get(nid, {}).get("imported_by", []))
 
-        transitive_impact = self._blast_radius_node_ids(changed_node_ids) - direct_impact - changed_node_ids
+        transitive_impact = self._blast_radius_node_ids(merged_graph, changed_node_ids) - direct_impact - changed_node_ids
 
         upstream_deps: Set[str] = set()
         for nid in changed_node_ids:
-            upstream_deps.update(graph.get(nid, {}).get("imports", []))
+            upstream_deps.update(merged_graph.get(nid, {}).get("imports", []))
 
         def describe(nid: str) -> str:
-            node = graph.get(nid, {})
+            node = merged_graph.get(nid, {})
             return f"{node.get('repo', '?')}::{node.get('path', nid)}"
 
-        lines = [f"[BLAST RADIUS] Impact analysis for {len(changed_files)} changed file(s).", "", "Changed files:"]
+        lines = [
+            f"[BLAST RADIUS] Impact analysis for {len(changed_files)} changed file(s) "
+            f"(searched repos: {', '.join(aliases)}).",
+            "", "Changed files:",
+        ]
         lines.extend(f"  - {f}" for f in changed_files)
 
         if unresolved:
